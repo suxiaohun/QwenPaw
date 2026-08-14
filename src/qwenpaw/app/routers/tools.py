@@ -11,6 +11,12 @@ from fastapi import APIRouter, Body, HTTPException, Path, Request
 from pydantic import BaseModel, Field
 
 from ...config import load_config, save_config
+from ...drivers.credentials.types import CredentialRecord
+from ...security.secret_store import (
+    mask_secret_value,
+    restore_masked_secret_value,
+)
+from ..driver_config_service import DriverConfigService
 from ..utils import schedule_agent_reload
 
 router = APIRouter(prefix="/tools", tags=["tools"])
@@ -83,6 +89,31 @@ class ToolConfigUpdate(BaseModel):
         default_factory=dict,
         description="Tool configuration key-value pairs",
     )
+
+
+_BUILTIN_TOOL_CONFIG_FIELDS: dict[str, list[dict]] = {
+    "web_search": [
+        {
+            "name": "provider",
+            "label": "Provider",
+            "type": "select",
+            "options": ["tavily", "anysearch"],
+            "default": "tavily",
+        },
+        {
+            "name": "api_key",
+            "label": "API Key (optional)",
+            "type": "password",
+        },
+    ],
+}
+
+
+def _builtin_credential_ref(tool_name: str, config: dict) -> str:
+    """Return the credential-store ref for a builtin tool's password field,
+    or "" when provider is missing/blank (caller must skip credential I/O)."""
+    provider = str(config.get("provider") or "").strip()
+    return f"tool/{tool_name}/{provider}" if provider else ""
 
 
 def _persist_browser_experimental(config: dict[str, Any]) -> None:
@@ -173,6 +204,13 @@ def _build_tool_info(tool_config: Any, tool_name: str) -> ToolInfo:
         except Exception:
             pass
         tool_info.config_values = config_values
+    elif tool_name in _BUILTIN_TOOL_CONFIG_FIELDS:
+        tool_info.config_fields = [
+            ToolConfigField(**f)
+            for f in _BUILTIN_TOOL_CONFIG_FIELDS[tool_name]
+        ]
+        if tool_config.config:
+            tool_info.config_values = dict(tool_config.config)
 
     return tool_info
 
@@ -305,12 +343,18 @@ async def update_tool_async_execution(
 async def get_tool_config(
     tool_name: str = Path(...),
     request: Request = None,
+    provider: str | None = None,
 ) -> dict[str, Any]:
     """Get tool configuration (sensitive fields masked).
 
     Args:
         tool_name: Tool function name
         request: FastAPI request
+        provider: Optional provider to query credentials for (builtin tools
+            with per-provider credential slots, e.g. web_search). When
+            provided, the credential ref is computed from this value instead
+            of the currently saved config, so the frontend can show the key
+            for a provider the user is *about to* select.
 
     Returns:
         Tool configuration with sensitive fields masked
@@ -356,6 +400,29 @@ async def get_tool_config(
                     if masked_config[field["name"]]:
                         masked_config[field["name"]] = "***"
             return masked_config
+
+    elif tool_name in _BUILTIN_TOOL_CONFIG_FIELDS:
+        result = dict(config)
+        pw_field = next(
+            (
+                f
+                for f in _BUILTIN_TOOL_CONFIG_FIELDS[tool_name]
+                if f["type"] == "password"
+            ),
+            None,
+        )
+        if pw_field:
+            ref_provider = (provider or "").strip() or result.get("provider")
+            if ref_provider:
+                result["provider"] = ref_provider
+                ref = f"tool/{tool_name}/{ref_provider}"
+                record = await DriverConfigService(
+                    workspace,
+                ).load_optional_credential(ref)
+                key = record.secrets.get("api_key", "") if record else ""
+                if key:
+                    result[pw_field["name"]] = mask_secret_value(key)
+        return result
 
     return config
 
@@ -430,6 +497,36 @@ async def update_tool_config(
                         config_to_save[field_name] = existing_config[
                             field_name
                         ]
+
+    elif tool_name in _BUILTIN_TOOL_CONFIG_FIELDS:
+        pw_field = next(
+            (
+                f
+                for f in _BUILTIN_TOOL_CONFIG_FIELDS[tool_name]
+                if f["type"] == "password"
+            ),
+            None,
+        )
+        if pw_field and pw_field["name"] in config_to_save:
+            incoming = config_to_save.pop(pw_field["name"])
+            ref = _builtin_credential_ref(tool_name, config_to_save)
+            if ref:
+                svc = DriverConfigService(workspace)
+                old_record = await svc.load_optional_credential(ref)
+                old_key = (
+                    old_record.secrets.get("api_key", "") if old_record else ""
+                )
+                new_key = restore_masked_secret_value(incoming, old_key)
+                if new_key:
+                    await svc.credential_store.put(
+                        CredentialRecord(
+                            ref=ref,
+                            kind="static",
+                            secrets={"api_key": new_key},
+                        ),
+                    )
+                elif old_record:
+                    await svc.credential_store.delete(ref)
 
     # Save tool config for this agent
     try:
